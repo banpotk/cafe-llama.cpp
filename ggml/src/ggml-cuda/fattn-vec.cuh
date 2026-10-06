@@ -560,7 +560,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     }
 
     launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false,
-        WARP_SIZE, q_data);
+        WARP_SIZE, false, q_data);
 
     if constexpr (type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO3_0) {
         // V rows are stored FWHT rotated, so sum(p*V) is the rotated output; undo it here so

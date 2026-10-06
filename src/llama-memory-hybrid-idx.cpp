@@ -687,7 +687,6 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 
     kpool_state st;
     st.n_pool_real = lay.n_pool_real;
-    st.cache_safe  = lay.cache_safe;
 
     return st;
 }
@@ -807,10 +806,6 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
     return kpool_cur().n_new_g;
 }
 
-bool llama_memory_hybrid_idx_context::get_kpool_cache_safe() const {
-    return kpool_cur().cache_safe;
-}
-
 bool llama_memory_hybrid_idx_context::get_mtp_dsa_index_share() const {
     return mem != nullptr && mem->get_mtp_dsa_index_share();
 }
@@ -847,13 +842,11 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
-    GGML_ASSERT(st.cache_safe == (new_pool_rep != nullptr));
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
     GGML_ASSERT(new_pool_idxs->ne[0] == (int64_t) kpool && new_pool_idxs->ne[1] == (int64_t) n_new_g);
-    if (new_pool_rep != nullptr) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_rep->buffer));
-        GGML_ASSERT(new_pool_rep->ne[0] == (int64_t) n_new_g);
-    }
+    // the graph always scatters the fresh pooled keys back into the cache, see build_qsa_sel
+    GGML_ASSERT(new_pool_rep != nullptr && ggml_backend_buffer_is_host(new_pool_rep->buffer));
+    GGML_ASSERT(new_pool_rep->ne[0] == (int64_t) n_new_g);
     if (new_pool_pos != nullptr) {
         GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_pos->buffer));
         GGML_ASSERT(new_pool_pos->ne[0] == 4*(int64_t) n_new_g);
@@ -922,7 +915,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     int32_t * pcell = (int32_t *) pool_cells->data;
     int32_t * pidx  = (int32_t *) pool_idxs->data;
     int32_t * nidx  = (int32_t *) new_pool_idxs->data;
-    int64_t * nrep  = new_pool_rep != nullptr ? (int64_t *) new_pool_rep->data : nullptr;
+    int64_t * nrep  = (int64_t *) new_pool_rep->data;
     int32_t * npos  = new_pool_pos != nullptr ? (int32_t *) new_pool_pos->data : nullptr;
 
     if (npos != nullptr) {
@@ -955,9 +948,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                 for (uint32_t k = 0; k < kpool; ++k) {
                     nidx[(size_t) i_new*kpool + k] = (int32_t) gcell(sq, sq.cells[j + k].second);
                 }
-                if (nrep != nullptr) {
-                    nrep[i_new] = gcell(sq, rep);
-                }
+                nrep[i_new] = gcell(sq, rep);
                 if (npos != nullptr) {
                     // a pooled key is rotated to the M-RoPE position of its first member
                     const uint32_t c = sq.cells[j].second;
@@ -975,24 +966,21 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     }
     GGML_ASSERT(i_new == n_new);
 
-    // Padded entries re-pool a cell whose pooled slot is never read. With no new pool that is the cell of the
-    // first token: it cannot belong to a complete pool, else the pool would be marked new. Otherwise it is the
-    // first member of a pool, which is never a pool's rep.
-    int64_t pad_cell = dummy_cell;
-    if (n_new > 0) {
-        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
-            const auto & sq = lay.seqs[s];
-            if (!sq.pools.empty()) {
-                pad_cell = gcell(sq, sq.cells[sq.pools[0]].second);
-                break;
+    // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
+    // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
+    if (n_new_g > n_new) {
+        std::vector<int64_t> reps(pcell, pcell + pool_end.size());
+        std::sort(reps.begin(), reps.end());
+
+        int64_t pad_cell = 0;
+        for (uint32_t i = n_new; i < n_new_g; ++i, ++pad_cell) {
+            while (std::binary_search(reps.begin(), reps.end(), pad_cell)) {
+                ++pad_cell;
             }
-        }
-    }
-    for (uint32_t i = n_new; i < n_new_g; ++i) {
-        for (uint32_t k = 0; k < kpool; ++k) {
-            nidx[(size_t) i*kpool + k] = (int32_t) pad_cell;
-        }
-        if (nrep != nullptr) {
+            GGML_ASSERT(pad_cell < (int64_t) kv_size*n_stream_kv);
+            for (uint32_t k = 0; k < kpool; ++k) {
+                nidx[(size_t) i*kpool + k] = (int32_t) pad_cell;
+            }
             nrep[i] = pad_cell;
         }
     }

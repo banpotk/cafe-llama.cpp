@@ -318,6 +318,12 @@ static void md_profile_save(const ggml_cuda_moe_direct_ctx & md) {
         const int64_t n = en.n_expert;
         const bool ok = fwrite(&n, sizeof(n), 1, f) == 1 && fwrite(md.score.data() + en.off, sizeof(float), n, f) == (size_t) n;
         fclose(f);
+#ifdef _WIN32
+        // rename does not replace an existing file on Windows
+        if (ok) {
+            remove(path.c_str());
+        }
+#endif
         if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
             remove(tmp.c_str());
         }
