@@ -101,6 +101,10 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// Hint: the last n_new of these tokens will be decoded next, right after the ones before them.
+// Models that read weights from disk per token (the qwen4exp n-gram table) start those reads in the background.
+LLAMA_API void llama_prefetch_tokens(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_new);
+
 // Marks the entries that a joint decision head (clef) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

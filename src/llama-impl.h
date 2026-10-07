@@ -77,6 +77,16 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
 // Prefetch the host pages needed to gather these rows.
 void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
 
+// Read the host pages of these rows now, many at once, so the page faults of a table mmap-ed from disk
+// run in parallel instead of one after another when a get_rows reads the rows later.
+void llama_fault_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
+
+// Start reading the pages of these rows in the background, for a llama_fault_rows that follows.
+void llama_prefetch_rows_async(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
+
+// Drop the background reads not started yet and wait for the others; call before unmapping their memory.
+void llama_prefetch_rows_cancel();
+
 struct time_meas {
     time_meas(int64_t & t_acc, bool disable = false);
     ~time_meas();

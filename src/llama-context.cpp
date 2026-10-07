@@ -4802,6 +4802,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }
 
+void llama_prefetch_tokens(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_new) {
+    ctx->get_model().prefetch_tokens(tokens, n_tokens, n_new);
+}
+
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
 }

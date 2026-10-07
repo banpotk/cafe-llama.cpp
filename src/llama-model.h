@@ -867,6 +867,13 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    // start reading from disk what the last n_new of these tokens need, see llama_prefetch_tokens()
+    virtual void prefetch_tokens(const llama_token * tokens, int32_t n_tokens, int32_t n_new) const {
+        GGML_UNUSED(tokens);
+        GGML_UNUSED(n_tokens);
+        GGML_UNUSED(n_new);
+    }
+
 protected:
     llama_model_params params;
 

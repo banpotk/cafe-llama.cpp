@@ -2692,11 +2692,13 @@ struct llama_model_clef : public llama_model_qwen35 {
 
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+    ~llama_model_qwen4exp() override;
 
     class llm_graph_input_kpool;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void prefetch_tokens(const llama_token * tokens, int32_t n_tokens, int32_t n_new) const override;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
