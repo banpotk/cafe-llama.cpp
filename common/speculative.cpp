@@ -2511,6 +2511,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             i_last[seq_id] = idx;
 
+            prefetch_tgt(dp);
+
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
@@ -2590,6 +2592,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
+                prefetch_tgt(dp);
+
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
@@ -2663,6 +2667,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
+
+    // the target verifies id_last and the drafts next; let it start the disk reads they need while the draft runs
+    void prefetch_tgt(const common_speculative_draft_params & dp) {
+        if (dp.prompt == nullptr) {
+            return;
+        }
+        // a few tokens of context are enough for any n-gram the target hashes
+        const size_t n_ctx = std::min<size_t>(dp.prompt->size(), 8);
+        prefetch_tokens.assign(dp.prompt->end() - n_ctx, dp.prompt->end());
+        prefetch_tokens.push_back(dp.id_last);
+        prefetch_tokens.insert(prefetch_tokens.end(), dp.result->begin(), dp.result->end());
+        llama_prefetch_tokens(params.ctx_tgt, prefetch_tokens.data(), (int32_t) prefetch_tokens.size(), 1);
+    }
+
+    llama_tokens prefetch_tokens;
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -3500,6 +3519,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.kv_mean_center_path.clear();
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
+
+    // the MoE cache is only used by the target context
+    result.moe_cache_size = 0;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

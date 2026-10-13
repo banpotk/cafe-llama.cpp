@@ -1163,12 +1163,14 @@ struct common_init_result::impl {
 };
 
 static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NAMES = {
-    { COMMON_DECISION_TYPE_OPENJEV, "openjev" },
-    { COMMON_DECISION_TYPE_LEV,     "lev"     },
-    { COMMON_DECISION_TYPE_KEV,     "kev"     },
-    { COMMON_DECISION_TYPE_NIMBLE,  "nimble"  },
-    { COMMON_DECISION_TYPE_LAYA,    "laya"    },
-    { COMMON_DECISION_TYPE_CLEF,    "clef"    },
+    { COMMON_DECISION_TYPE_OPENJEV,        "openjev"       },
+    { COMMON_DECISION_TYPE_LEV,            "lev"           },
+    { COMMON_DECISION_TYPE_KEV,            "kev"           },
+    { COMMON_DECISION_TYPE_NIMBLE,         "nimble"        },
+    { COMMON_DECISION_TYPE_LAYA,           "laya"          },
+    { COMMON_DECISION_TYPE_CLEF,           "clef"          },
+    { COMMON_DECISION_TYPE_PPLX_DECIDER,   "pplx-decider"  },
+    { COMMON_DECISION_TYPE_LFM2_D1,        "lfm2-d1"       },
 };
 
 static common_decision_type common_decision_type_from_string(const std::string & str) {
@@ -1793,6 +1795,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // note: params (and therefore params.kv_mean_center_path) is kept alive by the caller for
     // at least as long as it takes to call llama_init_from_model() with the returned cparams
     cparams.path_kv_mean_center = params.kv_mean_center_path.empty() ? nullptr : params.kv_mean_center_path.c_str();
+    cparams.moe_cache_size = params.moe_cache_size;
 
     return cparams;
 }

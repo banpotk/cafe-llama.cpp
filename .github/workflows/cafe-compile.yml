@@ -5,37 +5,115 @@ on:
   push:
     branches:
       - master
-    paths:
-      - '.github/workflows/cafe-compile.yml'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'tools/ui/**'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'tools/ui/**'
 
 concurrency:
-  group: cafe-compile-${{ github.ref }}
+  group: cafe-compile-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+
 jobs:
-  linux-cuda-x86_64:
-    name: Linux x86_64 CUDA
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
+  linux-cpu:
+    name: Linux ${{ matrix.build }} CPU
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build: 'x86_64'
+            os: ubuntu-22.04
+          - build: 'arm64'
+            os: ubuntu-24.04-arm
     steps:
       - name: Clone
         uses: actions/checkout@v6
 
+      - name: Register problem matchers
+        run: echo "::add-matcher::.github/problem-matchers/compiler.json"
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: compile-linux-cpu-${{ matrix.build }}
+          evict-old-files: 1d
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev
+
+      - name: Toolchain workaround (GCC 14)
+        if: ${{ contains(matrix.os, 'ubuntu-24.04') }}
+        run: |
+          sudo apt-get install -y gcc-14 g++-14
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j $(nproc)
+
+  linux-cuda:
+    name: Linux ${{ matrix.arch }} CUDA ${{ matrix.cuda }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: '12.6'
+            cuda_pkg: '12-6'
+            arch: x86_64
+            os: ubuntu-24.04
+            repo: ubuntu2404/x86_64
+          - cuda: '13.3'
+            cuda_pkg: '13-3'
+            arch: arm64
+            os: ubuntu-24.04-arm
+            repo: ubuntu2404/sbsa
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Register problem matchers
+        run: echo "::add-matcher::.github/problem-matchers/compiler.json"
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: compile-linux-cuda-${{ matrix.cuda }}-${{ matrix.arch }}
+          evict-old-files: 1d
+
       - name: Install CUDA toolkit
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/${{ matrix.repo }}/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo apt-get -y install cuda-toolkit-12-6
-          echo "/usr/local/cuda-12.6/bin" >> $GITHUB_PATH
-          echo "CUDA_PATH=/usr/local/cuda-12.6" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          sudo apt-get -y install cuda-toolkit-${{ matrix.cuda_pkg }} ninja-build libssl-dev
+          echo "/usr/local/cuda-${{ matrix.cuda }}/bin" >> $GITHUB_PATH
+          echo "CUDA_PATH=/usr/local/cuda-${{ matrix.cuda }}" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/usr/local/cuda-${{ matrix.cuda }}/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get install -y cmake build-essential ninja-build git libssl-dev libgomp1
-
-      - name: Configure
+      - name: Build
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -43,52 +121,168 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
             -DGGML_NATIVE=OFF \
             -DGGML_CUDA=ON \
-            -DGGML_CUDA_CUB_3DOT2=ON
+            -DGGML_CUDA_CUB_3DOT2=ON \
+            ${{ env.CMAKE_ARGS }}
+          set -o pipefail
+          cmake --build build -j "$(nproc)" 2>&1 | grep -v "^nvcc warning"
 
-      - name: Build
-        run: cmake --build build -j "$(nproc)"
-
-  linux-vulkan-x86_64:
-    name: Linux x86_64 Vulkan
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
+  linux-vulkan:
+    name: Linux ${{ matrix.build }} Vulkan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build: 'x86_64'
+            os: ubuntu-22.04
+          - build: 'arm64'
+            os: ubuntu-24.04-arm
     steps:
       - name: Clone
         uses: actions/checkout@v6
 
-      - name: Install dependencies
-        run: |
-          sudo add-apt-repository -y ppa:kisak/kisak-mesa
-          sudo apt-get update -y
-          sudo apt-get install -y build-essential cmake ninja-build mesa-vulkan-drivers libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libssl-dev
+      - name: Register problem matchers
+        run: echo "::add-matcher::.github/problem-matchers/compiler.json"
 
-      - name: Get latest Vulkan SDK version
-        run: echo "VULKAN_SDK_VERSION=$(curl -fsSL https://vulkan.lunarg.com/sdk/latest/linux.txt)" >> "$GITHUB_ENV"
-
-      - name: Setup Vulkan SDK
-        uses: ./.github/actions/unarchive-tar
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
         with:
-          url: https://sdk.lunarg.com/sdk/download/${{ env.VULKAN_SDK_VERSION }}/linux/vulkan_sdk.tar.xz
-          path: ./vulkan_sdk
-          strip: 1
+          key: compile-linux-vulkan-${{ matrix.build }}
+          evict-old-files: 1d
 
-      - name: Configure
+      - name: Dependencies
         run: |
-          source ./vulkan_sdk/setup-env.sh
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_VULKAN=ON
+          if [[ "${{ matrix.os }}" =~ "ubuntu-22.04" ]]; then
+            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+            sudo apt-get update -y
+            sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev
+          else
+            sudo apt-get update -y
+            sudo apt-get install -y gcc-14 g++-14 build-essential glslc libvulkan-dev spirv-headers libssl-dev ninja-build
+            echo "CC=gcc-14" >> "$GITHUB_ENV"
+            echo "CXX=g++-14" >> "$GITHUB_ENV"
+          fi
 
       - name: Build
         run: |
-          source ./vulkan_sdk/setup-env.sh
-          cmake --build build --config Release -j "$(nproc)"
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_VULKAN=ON \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j $(nproc)
 
-  windows-cuda-x86_64:
-    name: Windows x86_64 CUDA
+  linux-rocm:
+    name: Linux x86_64 ROCm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      ROCM_VERSION: "10.0.0"
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Register problem matchers
+        run: echo "::add-matcher::.github/problem-matchers/compiler.json"
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git cmake wget libssl-dev
+
+      - name: Setup TheRock with Wheels
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,devel]==${ROCM_VERSION}"
+          ROCM_PATH=$(rocm-sdk path --root)
+          echo "ROCM_PATH=$ROCM_PATH" >> $GITHUB_ENV
+          echo "CMAKE_PREFIX_PATH=$(rocm-sdk path --cmake)" >> $GITHUB_ENV
+          echo "HIP_PATH=$ROCM_PATH" >> $GITHUB_ENV
+          echo "PATH=$(rocm-sdk path --bin):${PATH}" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+          echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
+
+      - name: Build
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGPU_TARGETS="gfx1100" \
+            -DGGML_HIP=ON \
+            -DHIP_PLATFORM=amd \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j $(nproc)
+
+  windows-cpu:
+    name: Windows ${{ matrix.arch }} CPU
+    runs-on: windows-2025
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: 'x64'
+          - arch: 'arm64'
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Register problem matchers
+        run: echo "::add-matcher::.github/problem-matchers/compiler.json"
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: compile-windows-cpu-${{ matrix.arch }}
+          variant: ccache
+          evict-old-files: 1d
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.arch == 'x64' && 'x64' || 'amd64_arm64' }}
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/${{ matrix.arch }}-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=${{ matrix.arch == 'x64' && 'ON' || 'OFF' }} ^
+            -DGGML_OPENMP=ON ^
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release
+
+  windows-cuda:
+    name: Windows x64 CUDA
     runs-on: windows-2022
     timeout-minutes: 240
     steps:
       - name: Clone
         uses: actions/checkout@v6
+
+      - name: Register problem matchers
+        run: echo "::add-matcher::.github/problem-matchers/compiler.json"
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: compile-windows-cuda-x64
+          variant: ccache
+          evict-old-files: 1d
 
       - name: Install CUDA Toolkit
         uses: ./.github/actions/windows-setup-cuda
@@ -99,38 +293,138 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y
 
-      - name: Configure
+      - name: Build
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_CUDA=ON ^
-            -DGGML_CUDA_CUB_3DOT2=ON
-
-      - name: Build
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3 ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DCMAKE_CUDA_FLAGS="-diag-suppress=221" ^
+            -DCMAKE_CUDA_ARCHITECTURES=89-real ^
+            ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
 
-  macos-arm64:
-    name: macOS ARM64
-    runs-on: macos-latest
-    timeout-minutes: 240
+  windows-vulkan:
+    name: Windows x64 Vulkan
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      VULKAN_VERSION: 1.4.313.2
     steps:
       - name: Clone
         uses: actions/checkout@v6
 
-      - name: Configure
+      - name: Register problem matchers
+        run: echo "::add-matcher::.github/problem-matchers/compiler.json"
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: compile-windows-vulkan-x64
+          variant: ccache
+          evict-old-files: 1d
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DLLAMA_BUILD_BORINGSSL=ON ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release
+
+  windows-rocm:
+    name: Windows x64 ROCm
+    runs-on: windows-2022
+    timeout-minutes: 240
+    env:
+      ROCM_VERSION: "10.0.0"
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Register problem matchers
+        run: echo "::add-matcher::.github/problem-matchers/compiler.json"
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Setup ROCm
+        uses: ./.github/actions/windows-setup-rocm
+        with:
+          version: ${{ env.ROCM_VERSION }}
+
+      - name: Setup ROCm Environment
+        run: |
+          $ErrorActionPreference = "Stop"
+          & C:\TheRock\build\.venv\Scripts\Activate.ps1
+          rocm-sdk init
+          if ($LASTEXITCODE -ne 0) { throw "rocm-sdk init failed with exit code $LASTEXITCODE" }
+          $rocmPath = (rocm-sdk path --root).Trim()
+          $cmakePath = (rocm-sdk path --cmake).Trim()
+          $binPath = (rocm-sdk path --bin).Trim()
+          echo "HIP_PATH=$rocmPath" >> $env:GITHUB_ENV
+          echo "CMAKE_PREFIX_PATH=$cmakePath" >> $env:GITHUB_ENV
+          echo "HIP_DEVICE_LIB_PATH=$rocmPath\lib\llvm\amdgcn\bitcode" >> $env:GITHUB_ENV
+          echo "HIP_PLATFORM=amd" >> $env:GITHUB_ENV
+          echo "LLVM_PATH=$rocmPath\lib\llvm" >> $env:GITHUB_ENV
+          echo "$binPath" >> $env:GITHUB_PATH
+          echo "C:\TheRock\build\.venv\Scripts" >> $env:GITHUB_PATH
+
+      - name: Build
+        run: |
+          cmake -S . -B build `
+            -G "Ninja Multi-Config" `
+            -DCMAKE_PREFIX_PATH="${env:HIP_PATH}" `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_CPU=OFF `
+            -DGGML_HIP=ON `
+            -DCMAKE_C_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
+            -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang++.exe" `
+            -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types" `
+            -DCMAKE_HIP_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
+            -DHIP_PATH="${env:HIP_PATH}" `
+            -DAMDGPU_TARGETS="gfx1100"
+          cmake --build build --config Release --parallel ${env:NUMBER_OF_PROCESSORS} --target ggml-hip
+          if (-not (Test-Path build\bin\Release\ggml-hip.dll)) { throw "ggml-hip.dll was not produced" }
+
+  macos-arm64:
+    name: macOS ARM64 Metal
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Register problem matchers
+        run: echo "::add-matcher::.github/problem-matchers/compiler.json"
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: compile-macos-arm64
+          evict-old-files: 1d
+
+      - name: Build
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DGGML_NATIVE=OFF \
             -DGGML_METAL=ON \
-            -DGGML_METAL_EMBED_LIBRARY=OFF
-
-      - name: Build
-        run: cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
+            -DGGML_METAL_USE_BF16=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"

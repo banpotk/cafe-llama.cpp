@@ -868,7 +868,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
         ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
-            case GGML_OP_NONE:
+            case GGML_OP_NONE: {
+                if (tensor->view_src != nullptr) {
+                    // full-tensor view created with ggml_view_tensor, transparent for the split state
+                    split_state = ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync);
+                } else {
+                    split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                }
+            } break;
             case GGML_OP_ARANGE: {
                 // arange has no inputs and every device computes the same values
                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};

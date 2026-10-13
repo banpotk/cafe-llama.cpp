@@ -6,10 +6,16 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <climits>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <sstream>
 
@@ -38,6 +44,188 @@ void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_
     }
 
     llama_prefetch(std::move(mr));
+}
+
+namespace {
+
+// Threads that each read one row at a time. A page fault blocks its thread, so the number of threads
+// is the number of disk reads in flight. Between gathers they touch the pages that prefetches asked for.
+struct llama_row_pool {
+    std::vector<std::thread> threads;
+
+    std::mutex              run_mtx; // one job at a time
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::condition_variable cv_done;
+
+    const std::function<void(size_t)> * job = nullptr;
+    size_t              n_items = 0;
+    std::atomic<size_t> next{0};
+    int                 n_busy  = 0;
+    int                 n_touching = 0;
+    uint64_t            gen     = 0;
+    bool                stop    = false;
+
+    std::deque<const char *> touch; // bytes whose pages a prefetch wants, oldest first
+
+    explicit llama_row_pool(int n_threads) {
+        for (int i = 0; i < n_threads; ++i) {
+            threads.emplace_back([this] { worker(); });
+        }
+    }
+
+    ~llama_row_pool() {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stop = true;
+        }
+        cv.notify_all();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
+
+    void worker() {
+        uint64_t seen = 0;
+        for (;;) {
+            const std::function<void(size_t)> * f = nullptr;
+            const char * p = nullptr;
+            size_t n = 0;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&] { return stop || gen != seen || !touch.empty(); });
+                if (stop) {
+                    return;
+                }
+                // a gather goes first; a late wake-up after it finished finds job == nullptr
+                if (gen != seen) {
+                    seen = gen;
+                    if (job != nullptr) {
+                        f = job;
+                        n = n_items;
+                        n_busy++;
+                    }
+                }
+                if (f == nullptr && !touch.empty()) {
+                    p = touch.front();
+                    touch.pop_front();
+                    n_touching++;
+                }
+            }
+            if (p != nullptr) {
+                (void) *(const volatile char *) p;
+                std::lock_guard<std::mutex> lk(mtx);
+                if (--n_touching == 0) {
+                    cv_done.notify_all();
+                }
+                continue;
+            }
+            if (f == nullptr) {
+                continue;
+            }
+            for (size_t i; (i = next.fetch_add(1)) < n;) {
+                (*f)(i);
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                if (--n_busy == 0) {
+                    cv_done.notify_all();
+                }
+            }
+        }
+    }
+
+    void run(size_t n, const std::function<void(size_t)> & f) {
+        std::lock_guard<std::mutex> run_lk(run_mtx);
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            job     = &f;
+            n_items = n;
+            next    = 0;
+            gen++;
+        }
+        cv.notify_all();
+        for (size_t i; (i = next.fetch_add(1)) < n;) {
+            f(i);
+        }
+        std::unique_lock<std::mutex> lk(mtx);
+        cv_done.wait(lk, [&] { return n_busy == 0; });
+        job = nullptr;
+    }
+
+    // drops the queued touches and waits for the ones being read, before the memory they point to goes away
+    void cancel_touch() {
+        std::unique_lock<std::mutex> lk(mtx);
+        touch.clear();
+        cv_done.wait(lk, [&] { return n_touching == 0; });
+    }
+
+    void add_touch(const char * const * ptrs, size_t n) {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            touch.insert(touch.end(), ptrs, ptrs + n);
+            // stale hints must not hold back the reads that are needed now
+            while (touch.size() > 4096) {
+                touch.pop_front();
+            }
+        }
+        cv.notify_all();
+    }
+};
+
+llama_row_pool & llama_get_row_pool() {
+    // enough reads in flight for a SATA or NVMe queue
+    static llama_row_pool pool(32);
+    return pool;
+}
+
+} // namespace
+
+static bool llama_rows_in_host_memory(const ggml_tensor * tensor) {
+    return tensor && tensor->data && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer) && ggml_is_matrix(tensor);
+}
+
+// the first and the last byte of each row, for a row that crosses a page boundary
+static std::vector<const char *> llama_row_bytes(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) {
+    const auto * base = (const char *) tensor->data;
+    const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+
+    std::vector<const char *> ptrs;
+    ptrs.reserve(2*n_rows);
+    for (size_t i = 0; i < n_rows; ++i) {
+        if (rows[i] < 0 || rows[i] >= tensor->ne[1]) {
+            continue;
+        }
+        const char * p = base + (size_t) rows[i]*tensor->nb[1];
+        ptrs.push_back(p);
+        ptrs.push_back(p + row_bytes - 1);
+    }
+    return ptrs;
+}
+
+void llama_fault_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) {
+    if (!llama_rows_in_host_memory(tensor) || n_rows == 0) {
+        return;
+    }
+
+    const std::vector<const char *> ptrs = llama_row_bytes(tensor, rows, n_rows);
+    const std::function<void(size_t)> touch = [&](size_t i) {
+        (void) *(const volatile char *) ptrs[i];
+    };
+    llama_get_row_pool().run(ptrs.size(), touch);
+}
+
+void llama_prefetch_rows_async(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) {
+    if (!llama_rows_in_host_memory(tensor) || n_rows == 0) {
+        return;
+    }
+
+    const std::vector<const char *> ptrs = llama_row_bytes(tensor, rows, n_rows);
+    llama_get_row_pool().add_touch(ptrs.data(), ptrs.size());
+}
+
+void llama_prefetch_rows_cancel() {
+    llama_get_row_pool().cancel_touch();
 }
 
 time_meas::time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}

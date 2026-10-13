@@ -64,6 +64,15 @@ Qwen 3.8 Flash Next includes an internal Prompt Lookup Expert (PLE) N-gram hash 
 | `--no-ngram`  | `--disable-ngram`, `--no-load-ngram`    | Force completely disable the internal N-gram embedding table and PLE layers, skipping all PLE tensors (0 bytes allocated in RAM/VRAM). |
 | `--ngram`     | `--load-ngram`                          | Normal mode: load internal N-gram table and PLE layers into memory (default). |
 
+With `--ngram-ssd` each token reads 16 rows of 90 bytes from 16 random places in the 26.8 GiB table. The reads of a batch are issued from 32 threads at once instead of one page fault after another, and while the MTP draft runs, the rows of the tokens it proposes are already requested. The table's drive sets the cost: put the n-gram shard on the fastest SSD you have (a split GGUF can keep its first shard elsewhere through a symlink in the same folder).
+
+Measured on an RTX 3090 with a Ryzen 7 5800X, IQ3_XXS with `-hmoe -c 128000 --ngram-ssd`, MTP draft, coding prompt, ms per verify round (`--no-ngram`: 34-36 ms):
+
+| Drive with the table | Random 4K reads (QD32) | Before | Now |
+| --- | ---: | ---: | ---: |
+| WD Green 240 GB SATA, 97% full | ~990 IOPS | 45.9 - 50.9 | 44.2 - 48.6 |
+| SanDisk SSD Plus 1 TB SATA | ~4,350 IOPS | 44.5 - 47.0 | 35.9 - 42.4 |
+
 ### Qwen 3.8 Flash Next & MTP Speculative Decoding
 
 MTP (Multi-Token Prediction) draft models in GGUF format are available at:
@@ -78,7 +87,7 @@ Available quantizations:
 **Recommended Server Command for Qwen 3.8 Flash Next** (RTX 3090 24 GB, 64 GB RAM, ~60-80 t/s):
 ```sh
 llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
-  -md mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf \
+  -md mtp-Qwen3.8-Flash-Next-Q8_0-exps-Q4_0-shared.gguf \
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75 \
   -ngl 99 -hmoe -ngld 99 \
   -fa on -ctk q8_0 -ctv q8_0 -kvu -ctkd q4_0 -ctvd q4_0 \
@@ -89,7 +98,26 @@ llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
 - `-hmoe` keeps the experts in pinned RAM and the GPU computes them, with the hottest ones cached in the free VRAM. `--pipeline-parallel` is not needed.
 - A larger `-c` leaves less VRAM for the expert cache, so decode gets a bit slower at long contexts.
 - The first request after a fresh install is slower while the cache fills; the expert heat is saved in `~/.cache/llama.cpp/moe-direct`, so later starts are warm.
+- The draft is built as described below; the HF quantizations above carry their own LM head and leave less VRAM to the expert cache.
 - For repetitive text (code edits, quoted documents) add n-gram drafts: `--spec-type draft-mtp,ngram-mod --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64`.
+
+**Draft quantization matters more than draft size.** A draft that is Q2_K everywhere quantizes its own LM head and attention to 2 bits. It is then often not confident enough to pass `--spec-draft-p-min`, so many verify rounds check one token. Keep the dense weights at Q8_0, quantize only the routed experts, and let the draft use the target's token embeddings and LM head instead of its own copy. This is the layout Strata uses for its draft layer.
+
+```sh
+# MTP head only, without token_embd / output: the loader takes them from the target model
+python convert_hf_to_gguf.py /path/to/Qwen3.8-Flash-Next --mtp --mtp-shared-embd --outtype bf16 --outfile mtp-shared-BF16.gguf
+llama-quantize --tensor-type ffn_gate_exps=q4_0 --tensor-type ffn_up_exps=q4_0 --tensor-type ffn_down_exps=q4_0 \
+  mtp-shared-BF16.gguf mtp-Qwen3.8-Flash-Next-Q8_0-exps-Q4_0-shared.gguf Q8_0
+```
+
+Such a draft loads only as `-md` of a Qwen 3.8 Flash Next target, whose embeddings and LM head it uses. Measured on an RTX 3090 with a Ryzen 7 5800X, the GSQ-RCO IQ3_XXS target, `-hmoe -c 128000 --no-ngram --spec-draft-n-max 4 --spec-draft-p-min 0.7`, warm cache, one reasoning prompt and one coding prompt (t/s):
+
+| Draft | Size | VRAM expert cache | Reasoning | Code |
+| --- | ---: | ---: | ---: | ---: |
+| Q2_K, own Q2_K LM head | 1.18 GB | - | 44.4 - 46.7 | 48.5 |
+| Q4_0, own Q6_K LM head | 2.36 GB | 11.9 GiB | 49.1 - 57.2 | 50.4 - 55.1 |
+| Q8_0, experts Q2_0, target LM head | 0.82 GB | 13.3 GiB | 59.8 - 60.2 | 49.5 - 50.3 |
+| Q8_0, experts Q4_0, target LM head | 1.53 GB | 12.6 GiB | 53.6 - 55.7 | 57.3 - 57.9 |
 
 **Recommended Server Command for Qwen 3.8 27B** (dense, built-in MTP head, RTX 3090 24 GB, ~65 t/s):
 ```sh
